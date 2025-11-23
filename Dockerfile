@@ -1,70 +1,51 @@
-# Stage 1: Build stage
+# Stage 1: Builder
 FROM python:3.11.2 AS builder
-
-ENV PYTHONUNBUFFERED 1
 WORKDIR /blt
 
-# Install system dependencies
+# Install system deps + Chromium in one layer
 RUN apt-get update && \
-    apt-get install -y postgresql-client libpq-dev \
-    libmemcached11 libmemcachedutil2 libmemcached-dev libz-dev \
-    dos2unix && \
-    rm -rf /var/lib/apt/lists/*
+    DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y --no-install-recommends \
+        postgresql-client libpq-dev \
+        libmemcached11 libmemcachedutil2 libmemcached-dev libz-dev \
+        dos2unix chromium && \
+    ln -sf /usr/bin/chromium /usr/local/bin/google-chrome && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# # Install Chrome WebDriver
-# RUN CHROMEDRIVER_VERSION=`curl -sS chromedriver.storage.googleapis.com/LATEST_RELEASE` && \
-#     mkdir -p /opt/chromedriver-$CHROMEDRIVER_VERSION && \
-#     curl -sS -o /tmp/chromedriver_linux64.zip http://chromedriver.storage.googleapis.com/$CHROMEDRIVER_VERSION/chromedriver_linux64.zip && \
-#     unzip -qq /tmp/chromedriver_linux64.zip -d /opt/chromedriver-$CHROMEDRIVER_VERSION && \
-#     rm /tmp/chromedriver_linux64.zip && \
-#     chmod +x /opt/chromedriver-$CHROMEDRIVER_VERSION/chromedriver && \
-#     ln -fs /opt/chromedriver-$CHROMEDRIVER_VERSION/chromedriver /usr/local/bin/chromedriver
+# Stage 2: Runtime
+FROM python:3.11.2-slim AS runtime
 
-# Install Chromium (works on all architectures)
-# Retry logic with --fix-missing for transient network errors
-RUN apt-get update \
-    && apt-get install -y --fix-missing chromium \
-    || (apt-get update && apt-get install -y --fix-missing chromium) \
-    && ln -sf /usr/bin/chromium /usr/local/bin/google-chrome \
-    && rm -rf /var/lib/apt/lists/*
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:0.5.0 /uv /uvx /bin/
 
-# Install Poetry and dependencies
-RUN pip install poetry
-RUN poetry config virtualenvs.create false
-COPY pyproject.toml poetry.lock* ./
-# Clean any existing httpx installation and update pip
-RUN pip uninstall -y httpx || true
-RUN pip install --upgrade pip
-# Install dependencies with Poetry
-RUN poetry install --no-root --no-interaction
-
-# Install additional Python packages
-RUN pip install opentelemetry-api opentelemetry-instrumentation
-
-# Stage 2: Runtime stage
-FROM python:3.11.2-slim
-
-ENV PYTHONUNBUFFERED 1
 WORKDIR /blt
 
-# Copy only necessary files from builder stage
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    PATH="/opt/venv/bin:$PATH" \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    PYTHONDONTWRITEBYTECODE=1
 
-# Install runtime system dependencies
+# Install lean runtime deps
 RUN apt-get update && \
-    apt-get install -y postgresql-client libpq-dev \
-    libmemcached11 libmemcachedutil2 dos2unix && \
+    apt-get install -y --no-install-recommends \
+        postgresql-client libpq5 \
+        libmemcached11 libmemcachedutil2 dos2unix && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy application code
+# Mount deps + source together → single sync
 COPY . /blt
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen && \
+    rm -rf /blt/.venv
 
-# Convert line endings and set permissions
-RUN dos2unix Dockerfile docker-compose.yml scripts/entrypoint.sh ./blt/settings.py
-# Check if .env exists and run dos2unix on it, otherwise skip
-RUN if [ -f /blt/.env ]; then dos2unix /blt/.env; fi
-RUN chmod +x /blt/scripts/entrypoint.sh
+# Copy needed binary from builder
+COPY --from=builder /usr/local/bin/google-chrome /usr/local/bin/google-chrome
+
+# Final prep
+RUN dos2unix docker-compose.yml /blt/scripts/entrypoint.sh ./blt/settings.py && \
+    ([ ! -f /blt/.env ] || dos2unix /blt/.env) && \
+    chmod +x /blt/scripts/entrypoint.sh
 
 ENTRYPOINT ["/blt/scripts/entrypoint.sh"]
-CMD ["poetry", "run", "python", "manage.py", "runserver", "0.0.0.0:8000"]
+CMD ["uv", "run", "python", "manage.py", "runserver", "0.0.0.0:8000"]
